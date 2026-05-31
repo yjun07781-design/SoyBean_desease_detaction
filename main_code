@@ -1,0 +1,417 @@
+python
+import cv2
+import numpy as np
+from ultralytics import YOLO
+import os
+import subprocess
+import threading
+import datetime
+import csv
+from flask import Flask, render_template_string, jsonify, send_file
+
+app = Flask(__name__)
+
+camera_lock = threading.Lock()
+last_saved_timestamp = None
+
+# =======================
+# 科研数据表初始化
+# =======================
+DATASET_DIR = "dataset"
+os.makedirs(DATASET_DIR, exist_ok=True)
+CSV_FILE = os.path.join(DATASET_DIR, "sti_records.csv")
+
+if not os.path.exists(CSV_FILE):
+    with open(CSV_FILE, mode='w', newline='', encoding='utf-8-sig') as f:
+        writer = csv.writer(f)
+        writer.writerow(["Timestamp", "Grid_Row", "Grid_Col", "G_Ratio(绿叶占比)", "D_Idx(病害惩罚项)", "STI_k8(当前指数)"])
+
+# =======================
+# 模型加载逻辑
+# =======================
+MODEL_PATH = "best.pt"
+try:
+    if os.path.exists(MODEL_PATH):
+        model = YOLO(MODEL_PATH)
+        print("AI 模型加载成功！")
+    else:
+        model = None
+except Exception as e:
+    model = None
+
+# =======================
+# 手机端全栈前端界面
+# =======================
+HTML_PAGE = """
+<!DOCTYPE html>
+<html>
+<head>
+    <title>大豆抗逆智能巡检终端</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <style>
+        body { text-align: center; font-family: -apple-system, sans-serif; padding: 10px; background-color: #f4f7f6; margin: 0; }
+        h2 { color: #2c3e50; font-size: 22px; margin-top: 10px; }
+        .card { background: white; border-radius: 12px; padding: 15px; margin-bottom: 15px; box-shadow: 0 4px 6px rgba(0,0,0,0.05); }
+        .card h3 { margin: 0 0 10px 0; color: #16a085; font-size: 16px; }
+        .input-group { display: flex; justify-content: space-between; margin-bottom: 10px; }
+        .input-group input { width: 28%; padding: 8px; border: 1px solid #ddd; border-radius: 6px; text-align: center; }
+        .calc-btn { background-color: #16a085; color: white; border: none; padding: 10px; width: 100%; border-radius: 6px; font-weight: bold; font-size: 16px; }
+        #calc-result { margin-top: 10px; font-weight: bold; color: #e74c3c; font-size: 15px;}
+        .btn { padding: 12px; font-size: 16px; font-weight: bold; margin: 5px; color: white; border: none; border-radius: 10px; width: 45%; text-decoration: none; display: inline-block; box-sizing: border-box;}
+        .btn-blue { background-color: #3498db; }
+        .btn-green { background-color: #27ae60; }
+        .btn-red { background-color: #e74c3c; width: 93%; margin-top: 10px; display: none;} 
+        .btn-download { background-color: #8e44ad; width: 30%; padding: 10px 5px; font-size: 13px; margin: 2px;} 
+        #status { font-size: 14px; color: #34495e; line-height: 1.6; font-weight: 500; margin-top: 10px;}
+        .sti-panel { background: #fff3cd; border-left: 5px solid #ffc107; padding: 10px; margin-top: 15px; border-radius: 6px; text-align: left; display: none;}
+        .sti-score { font-size: 24px; font-weight: bold; color: #d35400; text-align: center; margin: 10px 0;}
+        .sti-matrix { display: grid; grid-template-columns: repeat(3, 1fr); gap: 5px; text-align: center; font-size: 12px; margin-top: 10px; }
+        .matrix-cell { background: #ecf0f1; padding: 5px; border-radius: 4px; border: 1px solid #bdc3c7;}
+        .image-group { display: none; flex-direction: column; gap: 15px; margin-top: 15px;}
+        .image-container { background: white; border-radius: 12px; padding: 10px; box-shadow: 0 4px 6px rgba(0,0,0,0.05); }
+        .image-label { font-size: 14px; color: #7f8c8d; font-weight: bold; margin-bottom: 8px; border-bottom: 2px solid #ddd; padding-bottom: 4px;}
+        img { max-width: 100%; border-radius: 8px; border: 2px solid #ddd;}
+        #downloadArea { display: none; margin-top: 15px; background: #e8f8f5; padding: 10px; border-radius: 8px; border: 1px dashed #16a085;}
+    </style>
+</head>
+<body>
+    <h2>大豆抗逆智能巡检终端</h2>
+    <div class="card">
+        <h3>科学观测高度推演模型</h3>
+        <div class="input-group">
+            <input type="number" id="Wc" placeholder="株宽(cm)">
+            <input type="number" id="Sp" placeholder="株距(cm)">
+            <input type="number" id="Hp" placeholder="株高(cm)">
+        </div>
+        <button class="calc-btn" onclick="calculateHeight()">智能计算推荐高度</button>
+        <div id="calc-result">请先填入实测数据</div>
+    </div>
+    <div class="card">
+        <button class="btn btn-blue" id="previewBtn" onclick="togglePreview()">开启取景</button>
+        <button class="btn btn-green" onclick="takePhoto()">拍照分析</button>
+        <div id="status">系统已就绪，请计算高度或开启取景。</div>
+        <button class="btn btn-red" id="deleteBtn" onclick="deleteLastRecord()">删除本次作废记录 (清理数据)</button>
+        <div id="downloadArea">
+            <div style="font-size:13px; font-weight:bold; color:#16a085; margin-bottom:8px;">直接存入手机：</div>
+            <a id="dlGridBtn" href="#" download="专家评判图.jpg" class="btn btn-download">存专家图</a>
+            <a id="dlProcessedBtn" href="#" download="AI分析图.jpg" class="btn btn-download">存AI图</a>
+            <a href="/download_csv" class="btn btn-download" style="background-color:#2980b9;">存CSV表</a>
+        </div>
+        <div id="stiPanel" class="sti-panel">
+            <div style="font-weight: bold; color: #8e44ad;">核心评估指标</div>
+            <div class="sti-score" id="mainSti">STI: --</div>
+            <div class="sti-matrix" id="stiMatrix"></div>
+        </div>
+        <div class="image-group" id="imageGroup">
+            <div class="image-container">
+                <div class="image-label">AI分析图 (包含目标框与当前STI分数)</div>
+                <img id="processed-img" src="" alt="处理后的分析图">
+            </div>
+            <div class="image-container">
+                <div class="image-label">专家评判图 (交由专家评定 1-5 分)</div>
+                <img id="grid-img" src="" alt="专家评判图">
+            </div>
+        </div>
+    </div>
+    <script>
+        function calculateHeight() {
+            let wc = parseFloat(document.getElementById('Wc').value);
+            let sp = parseFloat(document.getElementById('Sp').value);
+            let hp = parseFloat(document.getElementById('Hp').value);
+            if(isNaN(wc) || isNaN(sp) || isNaN(hp)) return;
+            let final_height = Math.round(2.58 * Math.max(wc, sp) + hp);
+            document.getElementById('calc-result').innerHTML = "推荐离地高度：<span style='font-size:20px; text-decoration:underline;'>" + final_height + " cm</span>";
+        }
+        let isPreviewing = false;
+        let isCapturing = false;
+        function fetchNextFrame() {
+            if (!isPreviewing || isCapturing) return;
+            let img = document.getElementById('processed-img'); 
+            document.getElementById('imageGroup').style.display = 'flex';
+            document.getElementById('grid-img').parentNode.style.display = 'none'; 
+            img.onload = () => { if (isPreviewing && !isCapturing) img.src = '/preview_frame?t=' + new Date().getTime(); };
+            img.onerror = () => { if (isPreviewing && !isCapturing) setTimeout(() => { img.src = '/preview_frame?t=' + new Date().getTime(); }, 200); };
+            img.src = '/preview_frame?t=' + new Date().getTime();
+        }
+        function togglePreview() {
+            let btn = document.getElementById('previewBtn');
+            let imgGroup = document.getElementById('imageGroup');
+            if(!isPreviewing) {
+                isPreviewing = true;
+                imgGroup.style.display = 'flex';
+                document.getElementById('grid-img').parentNode.style.display = 'none'; 
+                document.getElementById('stiPanel').style.display = 'none'; 
+                document.getElementById('downloadArea').style.display = 'none';
+                document.getElementById('deleteBtn').style.display = 'none'; 
+                document.getElementById('status').innerHTML = "正在高速取景...";
+                btn.innerText = "停止取景";
+                fetchNextFrame();
+            } else {
+                isPreviewing = false;
+                btn.innerText = "开启取景";
+                imgGroup.style.display = 'none';
+            }
+        }
+        function takePhoto() {
+            if(isCapturing) return; 
+            isCapturing = true;
+            document.getElementById('status').innerHTML = "正在分析 (图片不留痕，全靠手机存)...";
+            document.getElementById('deleteBtn').style.display = 'none'; 
+            document.getElementById('downloadArea').style.display = 'none';
+            let processedImg = document.getElementById('processed-img');
+            let gridImg = document.getElementById('grid-img');
+            processedImg.onload = null; processedImg.onerror = null;
+            fetch('/capture')
+                .then(response => response.json())
+                .then(data => {
+                    isCapturing = false;
+                    if(data.success) {
+                        document.getElementById('status').innerHTML = "分析完毕！如需保留请手动点击下方保存。";
+                        document.getElementById('deleteBtn').style.display = 'inline-block'; 
+                        document.getElementById('downloadArea').style.display = 'block'; 
+                        let timeStr = data.timestamp;
+                        document.getElementById('dlProcessedBtn').href = data.processed_url + "?t=" + new Date().getTime();
+                        document.getElementById('dlProcessedBtn').download = "AI分析图_" + timeStr + ".jpg";
+                        document.getElementById('dlGridBtn').href = data.grid_url + "?t=" + new Date().getTime();
+                        document.getElementById('dlGridBtn').download = "专家评判图_" + timeStr + ".jpg";
+                        processedImg.src = data.processed_url + "?t=" + new Date().getTime();
+                        gridImg.src = data.grid_url + "?t=" + new Date().getTime();
+                        document.getElementById('grid-img').parentNode.style.display = 'block'; 
+                        if(data.selected_sti !== undefined) {
+                            document.getElementById('stiPanel').style.display = 'block';
+                            document.getElementById('mainSti').innerText = data.selected_grid + " -> STI: " + data.selected_sti.toFixed(1);
+                            let matrixHtml = "";
+                            data.all_grids_sti.forEach(score => {
+                                let bg = score > 40 ? "#d4edda" : (score > 10 ? "#fff3cd" : "#f8d7da");
+                                matrixHtml += `<div class="matrix-cell" style="background:${bg}">${score.toFixed(1)}</div>`;
+                            });
+                            document.getElementById('stiMatrix').innerHTML = matrixHtml;
+                        }
+                        isPreviewing = false;
+                        document.getElementById('previewBtn').innerText = "重新开启取景";
+                    } else { alert("检测发生错误: " + data.message); }
+                }).catch(err => { isCapturing = false; alert("网络超时！"); });
+        }
+        function deleteLastRecord() {
+            if(!confirm("确定要剔除刚才存进数据表的这条脏数据吗？")) return;
+            fetch('/delete_last')
+                .then(response => response.json())
+                .then(data => {
+                    if(data.success) {
+                        document.getElementById('status').innerHTML = "<b>" + data.message + "</b>";
+                        document.getElementById('imageGroup').style.display = 'none';
+                        document.getElementById('stiPanel').style.display = 'none';
+                        document.getElementById('downloadArea').style.display = 'none';
+                        document.getElementById('deleteBtn').style.display = 'none';
+                    } else { alert(data.message); }
+                });
+        }
+    </script>
+</body>
+</html>
+"""
+
+# =======================
+# 图像算法模块
+# =======================
+def calculate_green_ratio(roi_image):
+    img_float = np.float32(roi_image)
+    B, G, R = cv2.split(img_float)
+    
+    denom = R + G + B
+    denom[denom == 0] = 1
+    r, g, b = R / denom, G / denom, B / denom
+    
+    # ExG (超绿指数) 
+    exg = 2 * g - r - b
+    
+    # 物理学绝对阈值（学术界公认的绿叶/泥土分割线）
+    PHYSICAL_THRESH = 0.05
+    
+    exg_max = np.max(exg)
+    exg_min = np.min(exg)
+    
+    # 【振幅拦截器 1】：纯泥土/水泥陷阱拦截
+    # 如果这个格子连最亮的地方都没达到及格线，它绝对是背景
+    # 直接给 0%，彻底断绝 Otsu 拉伸背景的可能
+    if exg_max < PHYSICAL_THRESH:
+        return 0.0
+        
+    # 【振幅拦截器 2】：纯茂密绿叶陷阱拦截
+    # 如果这个格子连最暗的地方都及格了，它绝对是满铺的健康树冠
+    # 直接给 100%，彻底断绝 Otsu 强行把绿叶涂黑的可能
+    if exg_min > PHYSICAL_THRESH:
+        return 1.0
+    
+    # 【安全放行】：既有泥土又有绿叶的混合区
+    # 这个时候，局部 NORM_MINMAX 和 Otsu 才能发挥它们应有的光斑分割实力
+    exg_normalized = cv2.normalize(exg, None, alpha=0, beta=255, norm_type=cv2.NORM_MINMAX, dtype=cv2.CV_8U)
+    _, mask = cv2.threshold(exg_normalized, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    
+    # 【底线兜底】：无论 Otsu 选出了什么形状的白色，它在物理上必须大于 0.05
+    _, real_green_mask = cv2.threshold(exg, PHYSICAL_THRESH, 255, cv2.THRESH_BINARY)
+    final_mask = cv2.bitwise_and(mask, np.uint8(real_green_mask))
+    
+    total_pixels = roi_image.shape[0] * roi_image.shape[1]
+    return cv2.countNonZero(final_mask) / total_pixels
+
+def extract_lesion_mask(leaf_roi):
+    if leaf_roi.size == 0: return np.zeros((1,1), dtype=np.uint8)
+    hsv = cv2.cvtColor(leaf_roi, cv2.COLOR_BGR2HSV)
+    lower = np.array([10, 40, 20])
+    upper = np.array([35, 255, 255]) 
+    mask = cv2.inRange(hsv, lower, upper)
+    kernel = np.ones((3,3), np.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+    return mask
+
+@app.route('/')
+def index():
+    return render_template_string(HTML_PAGE)
+
+@app.route('/preview_frame')
+def preview_frame():
+    if not camera_lock.acquire(blocking=False): return "Camera Busy", 503
+    try:
+        subprocess.run(["rpicam-jpeg", "-o", "preview.jpg", "-t", "10", "--width", "640", "--height", "480", "-n"], check=True)
+        return send_file("preview.jpg", mimetype='image/jpeg')
+    except Exception as e: return str(e), 500
+    finally: camera_lock.release()
+
+@app.route('/capture')
+def capture():
+    global last_saved_timestamp
+    if model is None: return jsonify({"success": False, "message": "模型未加载！"})
+    
+    with camera_lock:
+        try:
+            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            last_saved_timestamp = timestamp 
+            
+            subprocess.run(["rpicam-jpeg", "-o", "temp.jpg", "-t", "2000", "--width", "640", "--height", "480", "-n", "--autofocus-mode", "auto"], check=True)
+            frame = cv2.imread("temp.jpg")
+            h, w, _ = frame.shape
+            
+            processed_img = frame.copy() 
+            grid_img = frame.copy()      
+            
+            results = model(frame, conf=0.3, verbose=False)
+            processed_img = results[0].plot() 
+            
+            box_masks = []
+            names = model.names
+            for box in results[0].boxes:
+                cls_id = int(box.cls[0])
+                cls_name = names[cls_id].lower()
+                
+                if 'health' in cls_name or '健康' in cls_name or 'normal' in cls_name:
+                    continue
+                    
+                bx1, by1, bx2, by2 = map(int, box.xyxy[0])
+                bx1, by1 = max(0, bx1), max(0, by1)
+                bx2, by2 = min(w, bx2), min(h, by2)
+                if bx2 > bx1 and by2 > by1:
+                    roi = frame[by1:by2, bx1:bx2]
+                    mask = extract_lesion_mask(roi)
+                    box_masks.append((bx1, by1, bx2, by2, mask))
+
+            h_s, w_s = h // 3, w // 3
+            best_grid = None
+            max_sti = -1
+            all_grids_sti = []
+            csv_rows = [] 
+            
+            for r in range(3):
+                for c in range(3):
+                    y1, y2, x1, x2 = r*h_s, (r+1)*h_s, c*w_s, (c+1)*w_s
+                    cv2.rectangle(processed_img, (x1, y1), (x2, y2), (255, 200, 0), 2)
+                    cv2.rectangle(grid_img, (x1, y1), (x2, y2), (255, 200, 0), 2)
+                    
+                    roi = frame[y1:y2, x1:x2]
+                    g_ratio = calculate_green_ratio(roi)
+                    g_pixels = g_ratio * h_s * w_s
+                    
+                    d_pixels = 0
+                    for (bx1, by1, bx2, by2, mask) in box_masks:
+                        ix1, ix2 = max(x1, bx1), min(x2, bx2)
+                        iy1, iy2 = max(y1, by1), min(y2, by2)
+                        if ix1 < ix2 and iy1 < iy2:
+                            mx1, mx2 = ix1 - bx1, ix2 - bx1
+                            my1, my2 = iy1 - by1, iy2 - by1
+                            lesion_slice = mask[my1:my2, mx1:mx2]
+                            d_pixels += cv2.countNonZero(lesion_slice)
+                    
+                    d_idx = d_pixels / (g_pixels + 1e-5)
+                    sti = 0
+                    if g_ratio > 0.05:
+                        sti = 100 * g_ratio * np.exp(-8.0 * (d_idx ** 2))
+                    
+                    all_grids_sti.append(float(sti))
+                    csv_rows.append([timestamp, r+1, c+1, round(g_ratio, 4), round(d_idx, 4), round(sti, 2)])
+                    
+                    if sti > max_sti and sti > 1.0:
+                        max_sti = sti
+                        best_grid = (x1, y1, x2, y2, r, c)
+
+            with open(CSV_FILE, mode='a', newline='', encoding='utf-8-sig') as f:
+                writer = csv.writer(f)
+                writer.writerows(csv_rows)
+
+            msg = f"共处理 {len(results[0].boxes)} 个目标框。"
+            selected_grid_str = ""
+            if best_grid:
+                x1, y1, x2, y2, r, c = best_grid
+                selected_grid_str = f"第{r+1}行 第{c+1}列"
+                cv2.rectangle(processed_img, (x1, y1), (x2, y2), (0, 255, 0), 8)
+                cv2.putText(processed_img, f"TARGET STI: {max_sti:.1f}", (x1+5, y1+35), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 3)
+            else: msg += "无达标抗逆植株。"
+
+            cv2.imwrite("grid_only_photo_ui.jpg", grid_img)
+            cv2.imwrite("processed_result_ui.jpg", processed_img)
+            
+            return jsonify({
+                "success": True, 
+                "message": msg, 
+                "timestamp": timestamp,
+                "processed_url": "/get_processed_image",
+                "grid_url": "/get_grid_image",
+                "selected_sti": float(max_sti) if max_sti > 0 else 0,
+                "all_grids_sti": all_grids_sti,
+                "selected_grid": selected_grid_str
+            })
+        
+        except Exception as e: return jsonify({"success": False, "message": str(e)})
+
+@app.route('/delete_last')
+def delete_last():
+    global last_saved_timestamp
+    if not last_saved_timestamp: return jsonify({"success": False, "message": "目前没有可撤销的记录"})
+    
+    try:
+        if os.path.exists(CSV_FILE):
+            with open(CSV_FILE, mode='r', encoding='utf-8-sig') as f:
+                lines = list(csv.reader(f))
+            if len(lines) > 0:
+                new_lines = [lines[0]] + [row for row in lines[1:] if row and row[0] != last_saved_timestamp]
+                with open(CSV_FILE, mode='w', newline='', encoding='utf-8-sig') as f:
+                    writer = csv.writer(f)
+                    writer.writerows(new_lines)
+        
+        last_saved_timestamp = None
+        return jsonify({"success": True, "message": "已成功在数据表中剔除上一张废片的所有数据！"})
+    except Exception as e: return jsonify({"success": False, "message": f"删除失败: {str(e)}"})
+
+@app.route('/get_processed_image')
+def get_processed_image(): return send_file("processed_result_ui.jpg", mimetype='image/jpeg')
+
+@app.route('/get_grid_image')
+def get_grid_image(): return send_file("grid_only_photo_ui.jpg", mimetype='image/jpeg')
+
+@app.route('/download_csv')
+def download_csv():
+    if os.path.exists(CSV_FILE):
+        return send_file(CSV_FILE, as_attachment=True, download_name=f"大豆参数记录表_{datetime.datetime.now().strftime('%Y%m%d')}.csv")
+    else:
+        return "数据表还未生成", 404
+
+if __name__ == '__main__': app.run(host='0.0.0.0', port=5000)
